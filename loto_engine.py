@@ -1,391 +1,590 @@
-"""
-loto_engine.py - data loading, statistics and grid recommendation for the French Loto.
+"""French Loto diagnostics and experimental winner-count models.
 
-Mathematical stance
--------------------
-* Every 5-number combination has exactly the same probability (1 / C(49,5)),
-  and draws are independent: past results cannot predict future numbers.
-* Loto prizes are pari-mutuel (shared among winners of a rank). Grids that
-  look like what most players pick (birthdays, sequences, "lucky" numbers)
-  win the same rank as everybody else and must share the pot.
-* So the only rational optimisation is to pick grids that are UNPOPULAR,
-  i.e. maximise the expected payout *if* you win. We learn popularity from
-  the FDJ archives: when a draw contains popular numbers / patterns, many
-  players win and the payout per winner ("rapport") drops.
+No draw prediction or expected-euro-return claim is made. See README.md.
 """
 from __future__ import annotations
 
+import hashlib
 import io
-import re
+import warnings
 import zipfile
+from dataclasses import dataclass, field
+from itertools import combinations
 from math import comb
 
 import numpy as np
 import pandas as pd
 from scipy import stats
-from sklearn.linear_model import RidgeCV
-from sklearn.model_selection import cross_val_score
+from scipy.special import xlogy
+from sklearn.linear_model import PoissonRegressor
+from sklearn.exceptions import ConvergenceWarning
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
 
-N_MAX = 49
-K = 5
-CHANCE_MAX = 10
-
-ODDS = {
-    "Jackpot (5 numbers + Chance)": comb(N_MAX, K) * CHANCE_MAX,
-    "2nd Tirage jackpot (5 numbers)": comb(N_MAX, K),
-}
-PRICE_GRID = 2.20
-PRICE_SECOND = 0.80
-
-
-# --------------------------------------------------------------------------- #
-# 1. Loading FDJ archives
-# --------------------------------------------------------------------------- #
-def _read_csv_bytes(raw: bytes, name: str) -> pd.DataFrame | None:
-    for enc in ("utf-8-sig", "latin-1"):
-        try:
-            df = pd.read_csv(io.BytesIO(raw), sep=";", encoding=enc, dtype=str,
-                             index_col=False)
-            if df.shape[1] > 3:
-                df.columns = [c.strip().lower() for c in df.columns]
-                df["__source"] = name
-                return df
-        except Exception:
-            continue
-    return None
+N_MAX, K, CHANCE_MAX = 49, 5, 10
+PRICE_GRID, PRICE_SECOND = 2.20, 0.80
+RULES_CHECKED = "2026-10-26"
+MODEL_START = pd.Timestamp("2019-11-04")
+ODDS = {"Jackpot (5 + Chance)": comb(49, 5) * 10, "2nd Tirage: 5 numbers": comb(49, 5)}
+BALL_COLS = [f"n{i}" for i in range(1, 6)]
+# Combine with/without-Chance ranks. Only the standard November 2019+ schema
+# is used for modelling. Older five-ball draws remain available for diagnostics.
+RANKS = {"main": {2: (7, 8), 3: (5, 6), 4: (3, 4), 5: (1, 2)},
+         "second": {2: (4,), 3: (3,), 4: (2,), 5: (1,)}}
+MAX_FILE_BYTES, MAX_TOTAL_BYTES = 30_000_000, 100_000_000
 
 
-def read_files(files: list[tuple[str, bytes]]) -> list[pd.DataFrame]:
-    """files: list of (filename, raw bytes). Accepts FDJ .zip archives or .csv."""
-    frames = []
-    for name, raw in files:
-        if name.lower().endswith(".zip"):
-            with zipfile.ZipFile(io.BytesIO(raw)) as z:
-                for inner in z.namelist():
-                    if inner.lower().endswith(".csv"):
-                        df = _read_csv_bytes(z.read(inner), inner)
-                        if df is not None:
-                            frames.append(df)
-        elif name.lower().endswith(".csv"):
-            df = _read_csv_bytes(raw, name)
-            if df is not None:
-                frames.append(df)
-    return frames
+def file_fingerprint(files: list[tuple[str, bytes]]) -> str:
+    h = hashlib.sha256()
+    for name, raw in sorted(files):
+        h.update(name.encode())
+        h.update(b"\0")
+        h.update(hashlib.sha256(raw).digest())
+    return h.hexdigest()
 
 
 def _to_num(s: pd.Series) -> pd.Series:
-    """FDJ numbers use French formatting: '1 234,50' -> 1234.5"""
-    s = s.astype(str).str.replace(" ", "", regex=False).str.replace(" ", "", regex=False)
-    s = s.str.replace(",", ".", regex=False)
-    return pd.to_numeric(s, errors="coerce")
+    text = s.astype(str).str.replace(r"[\s\u00a0\u202f]", "", regex=True)
+    return pd.to_numeric(text.str.replace(",", ".", regex=False), errors="coerce")
 
 
 def _parse_date(s: pd.Series) -> pd.Series:
-    s = s.astype(str).str.strip()
-    out = pd.to_datetime(s, format="%d/%m/%Y", errors="coerce")
-    for fmt in ("%Y%m%d", "%d/%m/%y", "%Y-%m-%d"):
-        miss = out.isna()
-        if not miss.any():
-            break
-        out[miss] = pd.to_datetime(s[miss], format=fmt, errors="coerce")
+    text = s.astype(str).str.strip()
+    out = pd.Series(pd.NaT, index=s.index, dtype="datetime64[ns]")
+    for fmt in ("%d/%m/%Y", "%Y%m%d", "%d/%m/%y", "%Y-%m-%d"):
+        missing = out.isna()
+        out.loc[missing] = pd.to_datetime(text[missing], format=fmt, errors="coerce")
     return out
 
 
-def _rank_cols(cols, prefix: str, second: bool) -> dict[int, str]:
-    pat = re.compile(rf"^{prefix}(\d+)(_second_tirage)?$")
-    out = {}
-    for c in cols:
-        m = pat.match(c)
-        if m and bool(m.group(2)) == second:
-            out[int(m.group(1))] = c
-    return out
+def read_files(files: list[tuple[str, bytes]]) -> tuple[list[pd.DataFrame], list[str]]:
+    """Read bounded CSV/ZIP inputs without extracting archives to disk."""
+    frames, issues = [], []
+    total = 0
+
+    def consume(raw: bytes, name: str):
+        nonlocal total
+        total += len(raw)
+        if len(raw) > MAX_FILE_BYTES or total > MAX_TOTAL_BYTES:
+            issues.append(f"{name}: size limit exceeded; skipped.")
+            return
+        for encoding in ("utf-8-sig", "cp1252", "latin-1"):
+            try:
+                df = pd.read_csv(io.BytesIO(raw), sep=";", encoding=encoding, dtype=str)
+                if df.empty or len(df.columns) < 5:
+                    issues.append(f"{name}: empty or unsupported semicolon CSV.")
+                    return
+                df.columns = [str(c).strip().lower() for c in df.columns]
+                if df.columns.duplicated().any():
+                    issues.append(f"{name}: duplicate column names; skipped.")
+                    return
+                df["__source"] = name
+                frames.append(df)
+                return
+            except UnicodeDecodeError:
+                continue
+            except (pd.errors.ParserError, pd.errors.EmptyDataError, ValueError) as exc:
+                issues.append(f"{name}: cannot read CSV ({exc}).")
+                return
+        issues.append(f"{name}: unsupported encoding.")
+
+    for name, raw in files:
+        if len(raw) > MAX_FILE_BYTES:
+            issues.append(f"{name}: input exceeds 30 MB; skipped.")
+            continue
+        if name.lower().endswith(".zip"):
+            try:
+                with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+                    members = [m for m in archive.infolist() if m.filename.lower().endswith(".csv")]
+                    if not members:
+                        issues.append(f"{name}: no CSV files found.")
+                    for member in members:
+                        if member.file_size > MAX_FILE_BYTES or total + member.file_size > MAX_TOTAL_BYTES:
+                            issues.append(f"{name}/{member.filename}: size limit exceeded; skipped.")
+                            continue
+                        consume(archive.read(member), f"{name}/{member.filename}")
+            except (zipfile.BadZipFile, RuntimeError, OSError, NotImplementedError) as exc:
+                issues.append(f"{name}: unreadable ZIP ({exc}).")
+        elif name.lower().endswith(".csv"):
+            consume(raw, name)
+        else:
+            issues.append(f"{name}: only CSV and ZIP inputs are supported.")
+    return frames, issues
 
 
 def normalise(frames: list[pd.DataFrame]) -> tuple[pd.DataFrame, list[str]]:
-    """
-    Returns a long table with one row per *draw event* (main draw, and 2nd Tirage
-    as a separate event) and the list of files skipped (wrong format).
-
-    Columns: date, weekday, kind ('main'|'second'), n1..n5 (sorted), chance,
-             payout_r{k} for pari-mutuel ranks, source.
-    """
-    events, skipped = [], []
-    for df in frames:
-        cols = list(df.columns)
-        main_balls = [f"boule_{i}" for i in range(1, 6)]
-        if not all(c in cols for c in main_balls):
-            skipped.append(df["__source"].iloc[0])
+    events, issues = [], []
+    for original in frames:
+        if original.empty:
             continue
-        # Current formula: numbers 1..49 + numero_chance 1..10 (since Oct 2008)
-        if "numero_chance" not in cols:
-            skipped.append(df["__source"].iloc[0] + " (old formula, no N° Chance)")
+        df = original.reset_index(drop=True)
+        source = str(df["__source"].iloc[0]) if "__source" in df else "input"
+        required = [f"boule_{i}" for i in range(1, 6)] + ["date_de_tirage", "numero_chance"]
+        if not all(c in df for c in required):
+            issues.append(f"{source}: unsupported format (requires five balls, date and Chance).")
             continue
-
-        date = _parse_date(df.get("date_de_tirage", pd.Series([None] * len(df))))
+        dates = _parse_date(df["date_de_tirage"])
+        chance = _to_num(df["numero_chance"]).to_numpy(float)
         for kind, suffix in (("main", ""), ("second", "_second_tirage")):
-            balls = [f"boule_{i}{suffix}" for i in range(1, 6)]
-            if not all(c in cols for c in balls):
+            names = [f"boule_{i}{suffix}" for i in range(1, 6)]
+            if not all(c in df for c in names):
                 continue
-            nums = np.column_stack([_to_num(df[c]) for c in balls])
-            ok = ~np.isnan(nums).any(axis=1)
-            if ok.sum() == 0:
+            nums = np.column_stack([_to_num(df[c]) for c in names]).astype(float)
+            valid = (np.isfinite(nums).all(1) & (nums == np.floor(nums)).all(1)
+                     & ((nums >= 1) & (nums <= 49)).all(1)
+                     & (np.diff(np.sort(nums, axis=1), axis=1) > 0).all(1)
+                     & dates.notna().to_numpy()
+                     & (dates >= pd.Timestamp("2008-10-06")).to_numpy())
+            if kind == "main":
+                valid &= np.isfinite(chance) & (chance == np.floor(chance)) & (chance >= 1) & (chance <= 10)
+            else:
+                valid &= (dates >= MODEL_START).to_numpy()
+            present = np.isfinite(nums).any(1)
+            rejected = int((~valid & (present if kind == "second" else True)).sum())
+            if rejected:
+                issues.append(f"{source}: rejected {rejected} invalid {kind} draw(s).")
+            if not valid.any():
                 continue
-            nums = np.sort(nums[ok].astype(int), axis=1)
-            ev = pd.DataFrame(nums, columns=[f"n{i}" for i in range(1, 6)])
-            ev["date"] = date[ok].values
-            ev["kind"] = kind
-            ev["chance"] = _to_num(df["numero_chance"])[ok].values if kind == "main" else np.nan
-            ev["source"] = df["__source"].iloc[0]
-            for rank, col in _rank_cols(cols, "rapport_du_rang", kind == "second").items():
-                ev[f"payout_r{rank}"] = _to_num(df[col])[ok].values
+            ev = pd.DataFrame(np.sort(nums[valid].astype(int), axis=1), columns=BALL_COLS)
+            ev["date"], ev["kind"] = dates[valid].to_numpy(), kind
+            ev["chance"] = chance[valid] if kind == "main" else np.nan
+            ev["source"] = source
+            special_game = any(word in source.lower() for word in ("super", "grand"))
+            ev["schema"] = np.where(ev["date"] >= MODEL_START, "standard_2019", "historical")
+            if special_game:
+                ev["schema"] = "special_game"
+                issues.append(f"{source}: special-game filename; excluded from standard Loto modelling.")
+            for rank in range(1, 10):
+                for prefix, target, integral in (("nombre_de_gagnant_au_rang", "winners", True),
+                                                  ("rapport_du_rang", "payout", False)):
+                    col = f"{prefix}{rank}{suffix}"
+                    if col not in df:
+                        continue
+                    values = _to_num(df[col]).to_numpy(float)[valid]
+                    bad = ~np.isfinite(values) | (values < 0)
+                    if integral:
+                        bad |= values != np.floor(values)
+                    malformed = bad & df.loc[valid, col].notna().to_numpy()
+                    if malformed.any():
+                        issues.append(f"{source}: {int(malformed.sum())} invalid {col} value(s) ignored.")
+                    values[bad] = np.nan
+                    ev[f"{target}_r{rank}"] = values
+            # Optional enriched CSV column: simple combinations sold, NOT
+            # players, receipts, euros or winning combinations. Never inferred.
+            exposure_col = f"total_combinations{suffix}"
+            if exposure_col in df:
+                values = _to_num(df[exposure_col]).to_numpy(float)[valid]
+                bad = ~np.isfinite(values) | (values <= 0) | (values != np.floor(values))
+                if bad.any():
+                    issues.append(f"{source}: {int(bad.sum())} invalid participation total(s) ignored.")
+                values[bad] = np.nan
+                ev["entries"] = values
+            else:
+                ev["entries"] = np.nan
             events.append(ev)
-
     if not events:
-        return pd.DataFrame(), skipped
+        return pd.DataFrame(), issues
     out = pd.concat(events, ignore_index=True)
-    nb = out[[f"n{i}" for i in range(1, 6)]]
-    out = out[((nb >= 1) & (nb <= N_MAX)).all(axis=1)]
-    out["weekday"] = out["date"].dt.day_name()
-    out = out.drop_duplicates(subset=["date", "kind", "n1", "n2", "n3", "n4", "n5"])
-    return out.sort_values(["date", "kind"]).reset_index(drop=True), skipped
+    rows = []
+    value_cols = [c for c in out if c not in ("date", "kind", "source")]
+    for (date, kind), group in out.groupby(["date", "kind"], sort=True):
+        conflicts = [c for c in value_cols if group[c].dropna().nunique() > 1]
+        if conflicts:
+            issues.append(f"{date.date()} {kind}: conflicting duplicate data ({', '.join(conflicts)}); excluded.")
+            continue
+        row = {"date": date, "kind": kind, "source": " | ".join(sorted(group.source.unique()))}
+        for col in value_cols:
+            nonnull = group[col].dropna()
+            row[col] = nonnull.iloc[0] if len(nonnull) else np.nan
+        rows.append(row)
+    if not rows:
+        return pd.DataFrame(), issues
+    out = pd.DataFrame(rows).sort_values(["date", "kind"]).reset_index(drop=True)
+    out["weekday"] = out.date.dt.day_name()
+    return out, issues
+
+
+def load_files(files: list[tuple[str, bytes]]) -> tuple[pd.DataFrame, list[str]]:
+    frames, issues = read_files(files)
+    events, validation = normalise(frames)
+    return events, issues + validation
 
 
 def balls(df: pd.DataFrame) -> np.ndarray:
-    return df[[f"n{i}" for i in range(1, 6)]].to_numpy(dtype=int)
+    return df[BALL_COLS].to_numpy(dtype=int)
 
 
-# --------------------------------------------------------------------------- #
-# 2. Randomness diagnostics
-# --------------------------------------------------------------------------- #
+def random_grids(n: int, rng: np.random.Generator) -> np.ndarray:
+    return np.sort(np.argpartition(rng.random((n, 49)), 4, axis=1)[:, :5] + 1, axis=1)
+
+
 def frequency_table(df: pd.DataFrame) -> pd.DataFrame:
-    b = balls(df)
-    counts = np.bincount(b.ravel(), minlength=N_MAX + 1)[1:]
-    expected = len(df) * K / N_MAX
-    last_seen = {}
-    for idx, row in enumerate(b):
-        for n in row:
-            last_seen[n] = idx
-    n_draws = len(df)
-    return pd.DataFrame({
-        "number": np.arange(1, N_MAX + 1),
-        "count": counts,
-        "expected": expected,
-        "deviation_sd": (counts - expected) / np.sqrt(expected * (1 - K / N_MAX)),
-        "draws_since_last": [n_draws - 1 - last_seen.get(n, -1) for n in range(1, N_MAX + 1)],
-    })
+    if df.empty:
+        return pd.DataFrame(columns=["number", "count", "expected", "deviation_sd"])
+    counts = np.bincount(balls(df).ravel(), minlength=50)[1:]
+    expected = len(df) * 5 / 49
+    return pd.DataFrame({"number": np.arange(1, 50), "count": counts, "expected": expected,
+                         "deviation_sd": (counts - expected) / np.sqrt(expected * 44 / 49)})
 
 
 def chi_square_uniformity(df: pd.DataFrame) -> tuple[float, float]:
-    counts = np.bincount(balls(df).ravel(), minlength=N_MAX + 1)[1:]
-    chi2, p = stats.chisquare(counts)
-    return float(chi2), float(p)
+    """Without-replacement correction: (48/44) times Pearson -> chi-square(48)."""
+    if df.empty:
+        return np.nan, np.nan
+    ft = frequency_table(df)
+    adjusted = float((((ft["count"] - ft.expected) ** 2 / ft.expected).sum()) * 48 / 44)
+    return adjusted, float(stats.chi2.sf(adjusted, 48))
 
 
-def hot_numbers_backtest(df: pd.DataFrame, window: int = 100) -> pd.DataFrame:
-    """Does picking the 5 most frequent numbers of the last `window` draws do
-    better than chance? Expected matches per draw for any grid = 25/49 = 0.51."""
-    b = balls(df)
-    rows = []
+def randomness_check(df: pd.DataFrame, simulations: int = 999, seed: int = 2026) -> dict:
+    """Monte Carlo p-value simulating entire draws, including non-replacement."""
+    if df.empty or simulations < 99:
+        raise ValueError("Load draws and use at least 99 simulations.")
+    observed, _ = chi_square_uniformity(df)
+    rng, exceed = np.random.default_rng(seed), 0
+    expected = len(df) * 5 / 49
+    for _ in range(simulations):
+        counts = np.zeros(49, dtype=int)
+        for start in range(0, len(df), 2000):
+            sample = random_grids(min(2000, len(df) - start), rng)
+            counts += np.bincount(sample.ravel(), minlength=50)[1:]
+        statistic = np.sum((counts - expected) ** 2 / expected) * 48 / 44
+        exceed += statistic >= observed - 1e-12
+    p = (exceed + 1) / (simulations + 1)
+    return {"statistic": observed, "p": p,
+            "simulation_se": float(np.sqrt(p * (1 - p) / (simulations + 1))), "simulations": simulations}
+
+
+def block_mean_interval(values: np.ndarray, seed: int = 42, repeats: int = 500) -> tuple[float, float]:
+    """Moving-block bootstrap interval for a time-ordered mean."""
+    values = np.asarray(values, dtype=float)
+    if len(values) < 20:
+        return np.nan, np.nan
+    rng = np.random.default_rng(seed)
+    block = min(10, max(2, len(values) // 5))
+    starts = rng.integers(0, len(values) - block + 1, (repeats, int(np.ceil(len(values) / block))))
+    indices = (starts[..., None] + np.arange(block)).reshape(repeats, -1)[:, :len(values)]
+    return tuple(np.quantile(values[indices].mean(1), [0.025, 0.975]).tolist())
+
+
+def hot_numbers_backtest(df: pd.DataFrame, window: int = 100, seed: int = 2026) -> pd.DataFrame:
+    if window < 1:
+        raise ValueError("The look-back window must be positive.")
+    b = balls(df.sort_values("date")) if not df.empty else np.empty((0, 5), int)
+    rng, rows = np.random.default_rng(seed), []
     for t in range(window, len(b)):
-        counts = np.bincount(b[t - window:t].ravel(), minlength=N_MAX + 1)[1:]
-        hot = set(np.argsort(-counts)[:K] + 1)
-        cold = set(np.argsort(counts)[:K] + 1)
-        drawn = set(b[t])
-        rows.append((len(hot & drawn), len(cold & drawn)))
-    r = np.array(rows) if rows else np.zeros((0, 2))
-    return pd.DataFrame({
-        "strategy": ["Hot numbers", "Cold numbers", "Theory (any grid)"],
-        "avg matches / draw": [r[:, 0].mean() if len(r) else np.nan,
-                               r[:, 1].mean() if len(r) else np.nan,
-                               K * K / N_MAX],
-        "draws tested": [len(r), len(r), np.nan],
-    })
+        counts = np.bincount(b[t-window:t].ravel(), minlength=50)[1:]
+        tie = rng.random(49)
+        hot, cold = np.lexsort((tie, -counts))[:5] + 1, np.lexsort((tie, counts))[:5] + 1
+        random = rng.choice(np.arange(1, 50), 5, replace=False)
+        rows.append([np.isin(g, b[t]).sum() for g in (hot, cold, random)])
+    result = []
+    for i, name in enumerate(("Hot numbers", "Cold numbers", "Uniform random")):
+        sample = np.asarray(rows)[:, i] if rows else np.array([])
+        lo, hi = block_mean_interval(sample)
+        result.append({"Strategy": name, "Mean matches": sample.mean() if len(sample) else np.nan,
+                       "95% lower": lo, "95% upper": hi, "Draws tested": len(sample)})
+    return pd.DataFrame(result)
 
 
-# --------------------------------------------------------------------------- #
-# 3. Grid features (what makes a grid "popular")
-# --------------------------------------------------------------------------- #
-PATTERN_FEATURES = [
-    "n_le_31", "n_le_12", "sum", "consecutive_pairs", "n_even",
-    "n_decades", "max_same_last_digit", "spread", "n_multiple_of_7",
-]
-
-
-def pattern_features(b: np.ndarray) -> np.ndarray:
-    b = np.sort(b, axis=1)
-    diffs = np.diff(b, axis=1)
-    last_digit = b % 10
-    same_ld = np.max(np.stack([(last_digit == d).sum(axis=1) for d in range(10)], axis=1), axis=1)
-    decades = np.stack([((b // 10) == d).any(axis=1) for d in range(5)], axis=1).sum(axis=1)
-    return np.column_stack([
-        (b <= 31).sum(axis=1),
-        (b <= 12).sum(axis=1),
-        b.sum(axis=1),
-        (diffs == 1).sum(axis=1),
-        (b % 2 == 0).sum(axis=1),
-        decades,
-        same_ld,
-        b[:, -1] - b[:, 0],
-        (b % 7 == 0).sum(axis=1),
-    ]).astype(float)
-
-
-def one_hot(b: np.ndarray) -> np.ndarray:
-    X = np.zeros((len(b), N_MAX))
-    X[np.repeat(np.arange(len(b)), K), b.ravel() - 1] = 1.0
-    return X
+# Number 49 is the reference category. No duplicate linear aggregates (sum,
+# parity, birthday counts, multiples of seven) enter the full model.
+PATTERN_FEATURES = ["consecutive_pairs", "max_same_last_digit", "spread", "decades"]
 
 
 def design_matrix(b: np.ndarray) -> np.ndarray:
-    return np.hstack([one_hot(b), pattern_features(b)])
+    b = np.sort(np.asarray(b, dtype=int).reshape(-1, 5), axis=1)
+    onehot = np.zeros((len(b), 49))
+    onehot[np.arange(len(b))[:, None], b - 1] = 1
+    last = np.stack([(b % 10 == d).sum(1) for d in range(10)], axis=1).max(1)
+    decades = np.stack([(b // 10 == d).any(1) for d in range(5)], axis=1).sum(1)
+    patterns = np.column_stack([(np.diff(b, axis=1) == 1).sum(1), last, b[:, -1]-b[:, 0], decades])
+    return np.column_stack([onehot[:, :48], patterns])
 
 
-# --------------------------------------------------------------------------- #
-# 4. Popularity model, learned from payouts
-# --------------------------------------------------------------------------- #
-def payout_target(df: pd.DataFrame, min_cv: float = 0.05) -> tuple[pd.Series, list[str]]:
-    """
-    Builds a 'payout index' per draw event: for each pari-mutuel rank, log(payout)
-    is z-scored within (kind, rank); the index is the mean over available ranks.
-    High index = few winners = the drawn grid was UNPOPULAR.
-    Ranks with (almost) constant payout are fixed-prize ranks -> excluded.
-    Rank 1 is excluded (often no winner).
-    """
-    pcols = [c for c in df.columns if c.startswith("payout_r") and c != "payout_r1"]
-    used, z_parts = [], []
-    for kind in df["kind"].unique():
-        sub = df["kind"] == kind
-        for c in pcols:
-            v = df.loc[sub, c].where(df.loc[sub, c] > 0)
-            if v.notna().sum() < 50:
-                continue
-            if v.std() / v.mean() < min_cv:   # fixed prize rank
-                continue
-            lv = np.log(v)
-            z = (lv - lv.mean()) / lv.std()
-            z_parts.append(z.rename(f"{kind}_{c}"))
-            used.append(f"{kind}: {c.replace('payout_r', 'rank ')}")
-    if not z_parts:
-        return pd.Series(dtype=float), []
-    zdf = pd.concat(z_parts, axis=1)  # main and 2nd-tirage rows don't overlap -> NaN elsewhere
-    return zdf.mean(axis=1, skipna=True).reindex(df.index), used
+def context_matrix(dates: pd.Series) -> np.ndarray:
+    dates = pd.DatetimeIndex(dates)
+    weekday = np.eye(7)[dates.day_of_week][:, :6]
+    time = np.asarray((dates - MODEL_START).days, float) / 365.25
+    return np.column_stack([weekday, time])
+
+
+def model_matrix(df: pd.DataFrame, method: str) -> np.ndarray:
+    context = context_matrix(df.date)
+    if method == "context":
+        return context
+    b = balls(df)
+    if method == "birthday":
+        return np.column_stack([context, (b <= 31).sum(1)])
+    return np.column_stack([context, design_matrix(b)])
+
+
+def prepare_target(df: pd.DataFrame, kind: str, matches: int) -> tuple[pd.DataFrame, str]:
+    """Count tickets with exactly m main balls, regardless of Chance."""
+    if kind not in RANKS or matches not in RANKS[kind]:
+        raise ValueError("Choose main/second and 2, 3, 4 or 5 matching numbers.")
+    if df.empty:
+        return pd.DataFrame(), "No draw data loaded."
+    cols = [f"winners_r{r}" for r in RANKS[kind][matches]]
+    if not all(c in df for c in cols):
+        return pd.DataFrame(), "Winner-count columns for this match tier are missing."
+    d = df[(df.kind == kind) & (df.date >= MODEL_START)].copy()
+    if "schema" in d:
+        d = d[d.schema == "standard_2019"]
+    d["target"] = d[cols].sum(axis=1, min_count=len(cols))
+    valid = np.isfinite(d.target) & (d.target >= 0) & (d.target == np.floor(d.target))
+    d = d[valid].sort_values("date").reset_index(drop=True)
+    if "entries" not in d:
+        d["entries"] = np.nan
+    d = d[~(d.entries.notna() & (d.target > d.entries))].reset_index(drop=True)
+    return d, ""
+
+
+def chronological_splits(dates: pd.Series, n_splits: int = 3):
+    """Split distinct dates so records of the same date stay together."""
+    date_array = pd.to_datetime(dates).to_numpy()
+    unique = np.sort(np.unique(date_array))
+    for train, test in TimeSeriesSplit(n_splits=n_splits).split(unique):
+        yield np.flatnonzero(np.isin(date_array, unique[train])), np.flatnonzero(np.isin(date_array, unique[test]))
+
+
+def poisson_loss(y: np.ndarray, predicted: np.ndarray) -> np.ndarray:
+    mu, y = np.maximum(np.asarray(predicted, float), 1e-12), np.asarray(y, float)
+    return 2 * (xlogy(y, y / mu) - y + mu)
+
+
+def _fit_count(df: pd.DataFrame, method: str, alpha: float, exposure: bool):
+    scale = df.entries.to_numpy(float) / 1_000_000 if exposure else np.ones(len(df))
+    model = make_pipeline(StandardScaler(), PoissonRegressor(alpha=alpha, max_iter=1000, tol=1e-7))
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", ConvergenceWarning)
+            model.fit(model_matrix(df, method), df.target.to_numpy() / scale,
+                      poissonregressor__sample_weight=scale)
+    except ConvergenceWarning as exc:
+        raise RuntimeError("The count fit did not converge. Try a different scope; no learned recommendation is available.") from exc
+    return model
+
+
+def _predict_count(model, df: pd.DataFrame, method: str, exposure: bool) -> np.ndarray:
+    rates = model.predict(model_matrix(df, method))
+    return rates * (df.entries.to_numpy(float) / 1_000_000 if exposure else 1)
 
 
 class PopularityModel:
-    """Predicts the payout index of any grid. Falls back to a prior built from
-    documented player behaviour when the archives have no payout columns."""
+    """Per-tier Poisson model with an untouched chronological holdout.
 
-    # Prior (sign = effect on payout): birthdays, sequences, 7s are over-played.
-    PRIOR = {"n_le_31": -0.35, "n_le_12": -0.20, "consecutive_pairs": -0.25,
-             "n_multiple_of_7": -0.10, "max_same_last_digit": -0.10, "n_decades": +0.05}
-
+    Predicts matching-ticket rates, NOT exact ticket-choice probabilities,
+    prize shares or expected euros. Missing exposure disables learned selection.
+    """
     def __init__(self):
-        self.fitted = False
-        self.cv_r2 = np.nan
+        self.fitted = self.eligible = self.exposure_adjusted = False
         self.n_obs = 0
-        self.ranks_used: list[str] = []
-        self.number_effect = pd.Series(dtype=float)
-        self.pattern_effect = pd.Series(dtype=float)
+        self.status = "No model fitted. Use random selection or the birthday heuristic."
+        self.metrics, self.fold_results = pd.DataFrame(), pd.DataFrame()
+        self.ensemble, self.alpha = [], None
+        self.kind, self.matches = "main", 3
 
-    def fit(self, df: pd.DataFrame) -> "PopularityModel":
-        y, self.ranks_used = payout_target(df)
-        ok = y.notna()
-        if ok.sum() < 200:
+    def fit(self, df: pd.DataFrame, kind: str = "main", matches: int = 3) -> "PopularityModel":
+        self.__init__()
+        self.kind, self.matches = kind, matches
+        d, problem = prepare_target(df, kind, matches)
+        self.n_obs = len(d)
+        if len(d) < 320 or d.date.nunique() < 320:
+            self.status = problem or f"Only {len(d)} usable draws; at least 320 are required for chronological validation."
             return self
-        b = balls(df[ok])
-        X = design_matrix(b)
-        self.mu, self.sd = X.mean(0), X.std(0) + 1e-9
-        Xs = (X - self.mu) / self.sd
-        model = RidgeCV(alphas=np.logspace(-1, 4, 30))
-        self.cv_r2 = float(np.mean(cross_val_score(model, Xs, y[ok].values, cv=5, scoring="r2")))
-        model.fit(Xs, y[ok].values)
-        self.model = model
-        self.n_obs = int(ok.sum())
-        coef = model.coef_ / self.sd
-        self.number_effect = pd.Series(coef[:N_MAX], index=range(1, N_MAX + 1))
-        self.pattern_effect = pd.Series(coef[N_MAX:], index=PATTERN_FEATURES)
-        self.fitted = True
+        if d.target.sum() == 0:
+            self.status = "No winners observed in this tier; a count model cannot be fitted."
+            return self
+        self.exposure_adjusted = bool(d.entries.notna().all() and (d.entries > 0).all())
+        dates = np.sort(d.date.unique())
+        cutoff = dates[int(len(dates) * 0.8)]
+        dev, holdout = d[d.date < cutoff].reset_index(drop=True), d[d.date >= cutoff].reset_index(drop=True)
+        self.holdout_start, self.holdout_end = pd.Timestamp(cutoff), holdout.date.max()
+        splits = list(chronological_splits(dev.date))
+        if any(dev.iloc[tr].target.sum() == 0 for tr, _ in splits):
+            self.status = "Too few early winners to fit every training fold."
+            return self
+        # All methods get the same tuning budget. The last 20% of dates never
+        # enters alpha selection or fold preprocessing.
+        selected, fold_rows = {}, []
+        for method in ("context", "birthday", "full"):
+            candidates = []
+            for alpha in (0.1, 1.0, 10.0):
+                losses, rows = [], []
+                for fold, (train_idx, test_idx) in enumerate(splits, 1):
+                    train, test = dev.iloc[train_idx], dev.iloc[test_idx]
+                    model = _fit_count(train, method, alpha, self.exposure_adjusted)
+                    loss = poisson_loss(test.target, _predict_count(model, test, method, self.exposure_adjusted))
+                    losses.extend(loss)
+                    rows.append({"Method": method, "Fold": fold, "Train through": train.date.max().date(),
+                                 "Test from": test.date.min().date(), "Test through": test.date.max().date(),
+                                 "Draws": len(test), "Deviance": float(loss.mean())})
+                candidates.append((float(np.mean(losses)), alpha, rows))
+            best = min(candidates, key=lambda c: c[0])
+            selected[method] = best
+            fold_rows.extend(best[2])
+        self.alpha, self.fold_results = selected["full"][1], pd.DataFrame(fold_rows)
+        losses, rows = {}, []
+        for method in ("context", "birthday", "full"):
+            model = _fit_count(dev, method, selected[method][1], self.exposure_adjusted)
+            pred = _predict_count(model, holdout, method, self.exposure_adjusted)
+            loss = poisson_loss(holdout.target, pred)
+            losses[method] = loss
+            rows.append({"Method": method, "Chosen alpha": selected[method][1],
+                         "Rolling deviance": selected[method][0], "Holdout deviance": float(loss.mean()),
+                         "Holdout MAE": float(np.mean(np.abs(holdout.target.to_numpy() - pred)))})
+        # Constant count/rate estimated on training data only: no number choices.
+        train_scale = dev.entries.to_numpy() / 1e6 if self.exposure_adjusted else np.ones(len(dev))
+        test_scale = holdout.entries.to_numpy() / 1e6 if self.exposure_adjusted else np.ones(len(holdout))
+        constant = dev.target.sum() / train_scale.sum()
+        losses["uniform"] = poisson_loss(holdout.target, constant * test_scale)
+        rows.append({"Method": "uniform", "Chosen alpha": np.nan, "Rolling deviance": np.nan,
+                     "Holdout deviance": float(losses["uniform"].mean()),
+                     "Holdout MAE": float(np.mean(np.abs(holdout.target - constant * test_scale)))})
+        self.metrics, self.improvements = pd.DataFrame(rows), {}
+        for baseline in ("uniform", "context", "birthday"):
+            delta = losses[baseline] - losses["full"]
+            lo, hi = block_mean_interval(delta)
+            self.improvements[baseline] = {"mean": float(delta.mean()), "lower": lo, "upper": hi}
+        folds = self.fold_results.pivot(index="Fold", columns="Method", values="Deviance")
+        stable = int(((folds.full < folds.context) & (folds.full < folds.birthday)).sum())
+        passes = (all(v["lower"] > 0 for v in self.improvements.values()) and stable >= 2
+                  and selected["full"][0] < min(selected["context"][0], selected["birthday"][0]))
+        self.eligible, self.fitted, self.anchor_date = bool(passes and self.exposure_adjusted), True, d.date.max()
+        # Refit after validation. Recent-window spread measures sensitivity,
+        # not a calibrated confidence interval.
+        reference = random_grids(4000, np.random.default_rng(162))
+        for fraction in (1.0, 0.85, 0.7):
+            recent = d.iloc[-int(len(d) * fraction):]
+            estimator = _fit_count(recent, "full", self.alpha, self.exposure_adjusted)
+            pred = self._log_rate(estimator, reference)
+            self.ensemble.append((estimator, float(pred.mean()), max(float(pred.std()), 1e-6)))
+        if not self.exposure_adjusted:
+            self.status = ("Exploratory raw-count model: participation totals are incomplete. "
+                           "Sales volume and player choices cannot be separated reliably; learned selection is disabled.")
+        elif not passes:
+            self.status = ("Validation did not establish a stable advantage over all baselines. "
+                           "Learned selection is disabled; use random selection or the birthday heuristic.")
+        else:
+            self.status = ("The count model passed the chronological comparison for this scope. "
+                           "This is evidence about matching-ticket rates, not proof of higher returns.")
         return self
 
-    def score(self, b: np.ndarray) -> np.ndarray:
-        """Higher = less popular = higher expected payout if the grid wins."""
-        if self.fitted:
-            return self.model.predict((design_matrix(b) - self.mu) / self.sd)
-        F = pattern_features(b)
-        w = np.array([self.PRIOR.get(f, 0.0) for f in PATTERN_FEATURES])
-        return F @ w
+    def _log_rate(self, estimator, b: np.ndarray) -> np.ndarray:
+        frame = pd.DataFrame(b, columns=BALL_COLS)
+        frame["date"] = self.anchor_date
+        return np.log(np.maximum(estimator.predict(model_matrix(frame, "full")), 1e-12))
+
+    def score_details(self, b: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        if not self.eligible:
+            raise ValueError("Learned selection requires complete participation data and a passing validation result.")
+        scores = np.vstack([-(self._log_rate(m, b) - center) / scale for m, center, scale in self.ensemble])
+        mean, spread = scores.mean(0), scores.std(0)
+        return mean, spread, mean - spread
 
 
-# --------------------------------------------------------------------------- #
-# 5. Recommendation
-# --------------------------------------------------------------------------- #
-def random_grids(n: int, rng: np.random.Generator) -> np.ndarray:
-    return np.sort(np.argsort(rng.random((n, N_MAX)), axis=1)[:, :K] + 1, axis=1)
+@dataclass
+class Recommendation:
+    grids: pd.DataFrame
+    method: str
+    notes: list[str] = field(default_factory=list)
 
 
-def hard_filters(b: np.ndarray, past: set[tuple] | None) -> np.ndarray:
-    """Remove grids that are obviously over-played whatever the model says."""
-    F = pd.DataFrame(pattern_features(b), columns=PATTERN_FEATURES)
-    keep = (
-        (F["n_le_31"] <= 3)                 # at least 2 numbers above 31
-        & (F["consecutive_pairs"] <= 1)     # no run of 3
-        & (F["max_same_last_digit"] <= 2)
-        & (F["n_decades"] >= 3)             # no column / row look on the ticket
-        & F["n_even"].between(1, 4)
-    ).to_numpy()
-    if past:
-        keep = keep & np.array([tuple(r) not in past for r in b])
-    return keep
+def _validate_numbers(values, label):
+    values = list(values) if values is not None else []
+    if any(isinstance(x, (bool, np.bool_)) or not isinstance(x, (int, np.integer)) or not 1 <= x <= 49 for x in values):
+        raise ValueError(f"{label} must contain whole numbers between 1 and 49.")
+    if len(set(values)) != len(values):
+        raise ValueError(f"{label} contains duplicate numbers.")
+    return sorted(values)
 
 
-def recommend(model: PopularityModel, history: pd.DataFrame | None, n_grids: int = 5,
-              n_candidates: int = 200_000, max_overlap: int = 2,
-              must_include: list[int] | None = None, exclude: list[int] | None = None,
-              seed: int | None = None) -> tuple[pd.DataFrame, np.ndarray]:
+def recommend(model: PopularityModel | None = None, *, strategy: str = "random",
+              n_grids: int = 3, n_candidates: int = 20_000, max_overlap: int = 2,
+              must_include=None, exclude=None, seed: int | None = None) -> Recommendation:
+    if strategy not in ("random", "birthday", "learned"):
+        raise ValueError("Unknown selection strategy.")
+    if not isinstance(n_grids, int) or not 1 <= n_grids <= 20:
+        raise ValueError("Request between 1 and 20 grids.")
+    if not isinstance(max_overlap, int) or not 0 <= max_overlap <= 4:
+        raise ValueError("Maximum overlap must be between 0 and 4.")
+    if not isinstance(n_candidates, int) or not 100 <= n_candidates <= 200_000:
+        raise ValueError("Use between 100 and 200,000 candidates.")
+    if seed is not None and (not isinstance(seed, int) or isinstance(seed, bool) or seed < 0):
+        raise ValueError("The seed must be a non-negative whole number.")
+    must, excluded = _validate_numbers(must_include, "Required numbers"), _validate_numbers(exclude, "Excluded numbers")
+    if set(must) & set(excluded):
+        raise ValueError("A number cannot be both required and excluded.")
+    allowed = sorted(set(range(1, 50)) - set(excluded))
+    free = sorted(set(allowed) - set(must))
+    r, s = 5 - len(must), len(must)
+    if r < 0 or len(allowed) < 5:
+        raise ValueError("A grid needs exactly five distinct allowed numbers.")
+    possible = comb(len(free), r)
+    if possible < n_grids:
+        raise ValueError(f"Only {possible} distinct grid(s) satisfy the number constraints.")
+    if n_grids > 1:
+        minimum_overlap = max(s, 10 - len(allowed))
+        if max_overlap < minimum_overlap:
+            raise ValueError(f"These constraints force at least {minimum_overlap} shared numbers. Increase maximum overlap.")
+        t = max_overlap - s
+        bound = comb(len(free), t + 1) // comb(r, t + 1)
+        if n_grids > bound:
+            raise ValueError(f"At most {bound} grids can satisfy this overlap bound. Reduce the request or increase overlap.")
     rng = np.random.default_rng(seed)
-    cand = random_grids(n_candidates, rng)
-    if exclude:
-        cand = cand[~np.isin(cand, exclude).any(axis=1)]
-    if must_include:
-        cand = cand[np.isin(cand, must_include).sum(axis=1) == len(must_include)]
-    if len(cand) == 0:
-        raise ValueError("No candidate grid satisfies the include/exclude constraints.")
+    if possible <= n_candidates:
+        cand = np.array([sorted(must + list(c)) for c in combinations(free, r)], dtype=int)
+    else:
+        indices = np.argpartition(rng.random((n_candidates, len(free))), r - 1, axis=1)[:, :r]
+        chosen = np.asarray(free)[indices]
+        cand = np.sort(np.column_stack([np.tile(must, (len(chosen), 1)), chosen]), axis=1).astype(int)
+        cand = np.unique(cand, axis=0)
+    mean, spread = np.full(len(cand), np.nan), np.full(len(cand), np.nan)
+    if strategy == "learned":
+        if model is None:
+            raise ValueError("Load and validate a model first.")
+        mean, spread, score = model.score_details(cand)
+    elif strategy == "birthday":
+        score = (cand > 31).sum(1).astype(float)
+    else:
+        score = np.zeros(len(cand))
+    # Randomize within the best feasible decile, then restart greedy packing
+    # when necessary. A failed search is never presented as a complete result.
+    best = []
+    for _ in range(12):
+        remaining, selected = np.arange(len(cand)), []
+        while len(remaining) and len(selected) < n_grids:
+            pool = remaining if strategy == "random" else remaining[score[remaining] >= np.quantile(score[remaining], 0.9)]
+            idx = int(rng.choice(pool))
+            selected.append(idx)
+            overlaps = np.isin(cand[remaining], cand[idx]).sum(1)
+            remaining = remaining[overlaps <= max_overlap]
+        if len(selected) > len(best):
+            best = selected
+        if len(best) == n_grids:
+            break
+    if len(best) != n_grids:
+        raise ValueError(f"The search found only {len(best)} of {n_grids} grids. "
+                         "Try another seed, fewer grids or a larger overlap limit; feasibility was not proven.")
+    chosen = cand[best]
+    out = pd.DataFrame(chosen, columns=[f"N{i}" for i in range(1, 6)])
+    out.insert(0, "Grid", np.arange(1, len(out) + 1))
+    out["Chance"] = rng.integers(1, 11, len(out))
+    out["Numbers above 31"], out["Strategy"] = (chosen > 31).sum(1), strategy
+    if strategy == "learned":
+        out["Model score"], out["Refit spread"], out["Conservative score"] = mean[best], spread[best], score[best]
+    notes = ["Chance is sampled uniformly. It affects the jackpot and several lower ranks.",
+             "Overlap constraints change dependence between grids, not any individual grid's draw probability."]
+    if strategy == "birthday":
+        notes.append("Birthday avoidance is an uncalibrated heuristic, not a measured popularity advantage.")
+    if strategy == "learned":
+        notes.append("Scores describe a matching-ticket-rate proxy. Refit spread is not a confidence interval or an expected euro gain.")
+    return Recommendation(out, strategy, notes)
 
-    # Reference distribution = unconstrained random grids (for percentile display)
-    ref_scores = model.score(random_grids(50_000, rng))
 
-    past = {tuple(r) for r in balls(history)} if history is not None and len(history) else None
-    cand = cand[hard_filters(cand, past)]
-    cand = np.unique(cand, axis=0)
-    scores = model.score(cand)
-    order = np.argsort(-scores)
-
-    picked, picked_scores = [], []
-    for i in order:
-        g = set(cand[i])
-        if all(len(g & set(p)) <= max_overlap for p in picked):
-            picked.append(cand[i])
-            picked_scores.append(scores[i])
-            if len(picked) == n_grids:
-                break
-
-    # Chance number: popularity can't be learnt reliably from 10 values,
-    # and it only matters for the jackpot -> uniform random.
-    chances = rng.integers(1, CHANCE_MAX + 1, size=len(picked))
-    out = pd.DataFrame(np.array(picked), columns=[f"N{i}" for i in range(1, 6)])
-    out.insert(0, "Grid", np.arange(1, len(picked) + 1))
-    out["Chance"] = chances
-    out["Less popular than"] = [f"{stats.percentileofscore(ref_scores, s):.1f}% of random grids"
-                                for s in picked_scores]
-    F = pattern_features(np.array(picked))
-    out["Sum"] = F[:, PATTERN_FEATURES.index("sum")].astype(int)
-    out["Nb > 31"] = (K - F[:, PATTERN_FEATURES.index("n_le_31")]).astype(int)
-    return out, ref_scores
-
-
-def expected_value_note(model: PopularityModel) -> str:
-    return (f"Price per grid: €{PRICE_GRID:.2f} + €{PRICE_SECOND:.2f} for the 2nd Tirage. "
-            f"Odds of the jackpot: 1 in {ODDS['Jackpot (5 numbers + Chance)']:,}; "
-            f"2nd Tirage jackpot: 1 in {ODDS['2nd Tirage jackpot (5 numbers)']:,}. "
-            "Unpopular grids don't change these odds; they only increase what you'd "
-            "receive if you win a shared rank.")
+def expected_value_note() -> str:
+    return ("A simple grid costs €2.20. The optional 2nd Tirage adds €0.80. "
+            "All valid grids have the same draw probability. This app does not estimate expected euro returns. "
+            "Choosing a less popular grid may reduce sharing at shared prize ranks, but that benefit is not established here.")
