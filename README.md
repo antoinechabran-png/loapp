@@ -1,8 +1,93 @@
 # Loto Grid Explorer
 
-An experimental Streamlit app for standard French Loto. Every valid grid has
-the same probability of being drawn. This app does not predict winning numbers,
-estimate expected euro returns, or establish that its selections make money.
+An experimental Streamlit app for standard French Loto. Under a fair draw, every
+valid grid has the same probability. The app now includes a separate experiment
+testing whether persistent draw biases predict later results better than fairness.
+It does not establish that its selections make money or estimate expected returns.
+
+## New: experimental draw probabilities and weekly top ten
+
+Open **Draw probabilities** and enable **Enable draw-probability experiment**.
+Select Main draw or 2nd Tirage and the historical scope in the sidebar. At least
+400 validated draw dates are needed. Unlike the popularity model, this experiment
+needs only drawn numbers and (for the main game) Chance; sales and payouts are
+irrelevant. After enabling it, new uploads automatically recompute the cached fit.
+
+Choose a week to display ten outcomes and download the CSV. The table shows:
+
+- Rank, five numbers and Chance (Chance is omitted for the second draw).
+- Estimated model probability, fair-draw probability, their ratio and equivalent
+  '1 in' odds. These are conditional model estimates, not verified physical odds.
+- A sensitivity range across refits, when a nonuniform model is used.
+- Changes against the previous dataset/mode in the current browser session,
+  the selected week, data cutoff and an outcome-data fingerprint.
+
+If validation fails, the default is a reproducible random list with **all ten
+tied at rank 1 and equal probabilities**. When a nonuniform candidate beats the
+rolling baseline but fails final validation, you may explicitly show its
+unvalidated exploratory ranking. If fairness wins tuning, no forced alternative
+ranking is fabricated. Weeks rotate tied fallback lists, not winning odds.
+Uploading new data does not replace a week's tied fallback tickets merely for
+novelty. Repeated identical uploads reproduce the same result for the same week.
+
+For a nonuniform fit, the list is the exact highest-probability ten complete
+outcomes under the fitted model. It has no diversity constraint: outcomes can
+share four or five main numbers and differ only in Chance. This is distinct from
+the diversified grid selector in the Choose grids tab. A week labels the list;
+probabilities apply to one draw, not the chance of winning sometime that week.
+
+### Probability model
+
+For each unordered subset S of five of 49 balls, use
+
+`P(S) = exp(sum(theta[i] for i in S)) / sum(exp(sum(theta[i] for i in T)) for all size-5 T)`.
+
+The denominator is the fifth elementary symmetric polynomial in the positive
+weights `exp(theta)`. Dynamic programming computes it exactly, including
+sampling without replacement. Equal weights give `1 / C(49,5)`. Chance is an
+independent ten-category distribution; full main-draw probabilities multiply
+the subset probability by its Chance probability. This conditional-Bernoulli
+(also called conditional-Poisson) subset family is a statistical alternative,
+not a claim about the mechanical extraction process or every possible bias.
+Background: [product-weight subset distribution](https://timvieira.github.io/conditional-poisson-sampling/).
+
+Fit per-ball weights to observed inclusion counts, augmented by 100, 1,000 or
+10,000 equivalent fair draws. Chance uses the same equivalent uniform prior
+count. An infinite-strength option is exactly uniform. This shrinks small
+departures toward fairness and gives every valid outcome nonzero probability.
+The fitted process is stationary within the scope: no overdue-number theory,
+pair interactions, recency tuning or weekday preference enters this experiment.
+It cannot detect every form of bias or account for undocumented machine changes.
+
+### Predictive evaluation
+
+The latest 20% of dates is held out. Three expanding folds within the earlier
+80% select prior strength by average log probability assigned to unseen complete
+outcomes, with ties preferring stronger shrinkage. Equal probabilities are an
+explicit candidate. The chosen fit is trained on the earlier 80%, frozen and
+evaluated on the last 20%. Holdout data never choose prior strength.
+
+To pass, the finite-strength model must improve average rolling log score,
+improve in at least two of three rolling folds, have a positive lower 95%
+moving-block-bootstrap interval for mean holdout log-score gain, and improve
+in at least two of three chronological holdout sections. The block interval
+uses 1,000 resamples with blocks up to ten whole draws. It is approximate, not
+a posterior probability of physical bias. A gain in nats per draw is not a
+percentage uplift in a selected ticket's winning chance.
+
+The displayed distribution is refitted on all supplied outcomes after evaluation.
+Ranking sensitivity ranges use the 10th/90th percentiles of 40 whole-draw block
+refits at fixed chosen strength. They are not calibrated confidence intervals,
+do not incorporate hyperparameter uncertainty, and do not adjust for selecting
+the highest-scoring outcomes. The normalizer, likelihood gradient and exact
+top-ten search are tested against explicit small-case calculations.
+
+Repeated scope searches and reusing a refreshed holdout each week can overfit
+the evidence. A pass is conditional on this analysis and must be confirmed on
+new, unseen future draws. It evaluates the full probability model, **not** the
+realized hit rate of the top ten. No real FDJ predictive advantage has been
+demonstrated in the delivered version; the tests use synthetic fair and biased
+processes. Historical data were not available locally during development.
 
 ## Run
 
@@ -152,7 +237,7 @@ Sources:
 ## Tests
 
 ```powershell
-python -m unittest -v test_loto_engine.py
+python -m unittest -v test_loto_engine.py test_draw_model.py
 ```
 
 The deterministic synthetic checks cover malformed data, rank mappings, dates,

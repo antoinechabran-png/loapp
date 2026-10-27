@@ -1,6 +1,7 @@
 """French Loto diagnostics and experimental winner-count models.
 
-No draw prediction or expected-euro-return claim is made. See README.md.
+This module concerns player counts; the separate draw_model.py implements an
+experimental draw-bias test. No expected-euro-return claim is made. See README.md.
 """
 from __future__ import annotations
 
@@ -586,5 +587,5 @@ def recommend(model: PopularityModel | None = None, *, strategy: str = "random",
 
 def expected_value_note() -> str:
     return ("A simple grid costs €2.20. The optional 2nd Tirage adds €0.80. "
-            "All valid grids have the same draw probability. This app does not estimate expected euro returns. "
+            "Under fair draws, all valid grids have the same probability. This app does not estimate expected euro returns. "
             "Choosing a less popular grid may reduce sharing at shared prize ranks, but that benefit is not established here.")

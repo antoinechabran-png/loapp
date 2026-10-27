@@ -1,10 +1,13 @@
 """Run with: python -m streamlit run app.py"""
 from pathlib import Path
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
 
 import loto_engine as E
+import draw_model as D
 
 st.set_page_config(page_title="Loto Grid Explorer", page_icon="🎱", layout="wide")
 DATA_DIR = Path(__file__).parent / "data"
@@ -27,10 +30,20 @@ def diagnose(content_scope_key: str, _df: pd.DataFrame):
     return E.randomness_check(_df)
 
 
+@st.cache_data(show_spinner="Testing draw probabilities against the fair-draw baseline…")
+def fit_draw_model(content_scope_key: str, _df: pd.DataFrame, game: str):
+    return D.DrawProbabilityModel().fit(_df, game)
+
+
+@st.cache_data(show_spinner="Ranking outcomes and checking refit stability…")
+def rank_draws(content_scope_key: str, week: str, exploratory: bool, _model):
+    return _model.ranking(week, exploratory=exploratory)
+
+
 st.title("🎱 Loto Grid Explorer")
-st.markdown("**Every valid grid has the same chance of being drawn.** "
-            "This app explores player-selection patterns and possible prize sharing. "
-            "It does not predict winning numbers or promise higher returns.")
+st.markdown("**Under a fair draw, every valid grid has the same probability.** "
+            "Explore prize-sharing patterns or test an experimental draw-bias model against that baseline. "
+            "Neither experiment promises higher returns.")
 
 st.sidebar.header("Data")
 uploads = st.sidebar.file_uploader("Standard FDJ Loto archives (.zip or .csv)",
@@ -86,8 +99,102 @@ if st.sidebar.button("Fit and validate model", disabled=scope.empty):
         st.sidebar.error(f"Model fitting failed: {exc}")
 model = st.session_state.get("model", E.PopularityModel())
 
-rec_tab, model_tab, random_tab, data_tab, cost_tab = st.tabs(
-    ["Choose grids", "Model evidence", "Draw diagnostics", "Data", "Odds & budget"])
+rec_tab, draw_tab, model_tab, random_tab, data_tab, cost_tab = st.tabs(
+    ["Choose grids", "Draw probabilities", "Model evidence", "Draw diagnostics", "Data", "Odds & budget"])
+
+with draw_tab:
+    st.subheader("Can past results predict later draws better than equal probabilities?")
+    st.write("This experiment uses only draw outcomes. It requires no winner counts or participation totals. "
+             "Main and second draws are analyzed separately using the selected sidebar scope.")
+    enabled = st.checkbox("Enable draw-probability experiment", value=False)
+    if enabled:
+        draw_key = f"{D.VERSION}|{fingerprint}|{period}|{saturday_only}|{kind}"
+        try:
+            draw_model = fit_draw_model(draw_key, scope, kind)
+        except (ValueError, ArithmeticError, RuntimeError) as exc:
+            draw_model = D.DrawProbabilityModel(kind)
+            st.error(f"The experiment could not be fitted: {exc}. The table below uses equal probabilities.")
+        if draw_model.eligible:
+            st.success(draw_model.status)
+        else:
+            st.info(draw_model.status)
+        st.caption("After this option is enabled, a new upload automatically recomputes the experiment. "
+                   "Identical draw outcomes do not alter the model. One new draw usually changes estimates only slightly.")
+        if draw_model.fitted:
+            st.write(f"{draw_model.n_obs:,} usable draws. Final holdout: "
+                     f"{draw_model.holdout_start.date()} to {draw_model.holdout_end.date()}.")
+            lower, upper = draw_model.holdout_interval
+            st.metric("Holdout mean log-score gain over fairness", f"{draw_model.holdout_gain:+.5f}")
+            st.caption(f"Approximate 95% block-bootstrap interval: [{lower:+.5f}, {upper:+.5f}] nats per draw. "
+                       "Positive means the model assigned more probability to unseen outcomes on average. "
+                       "This is not a percentage increase in your ticket's winning chance.")
+            with st.expander("Validation details"):
+                displayed_metrics = draw_model.metrics.copy()
+                displayed_metrics["Prior equivalent draws"] = displayed_metrics["Prior equivalent draws"].map(
+                    lambda value: "Uniform" if value == float("inf") else f"{value:,.0f}")
+                st.dataframe(displayed_metrics, hide_index=True)
+                st.dataframe(draw_model.folds, hide_index=True)
+                st.dataframe(draw_model.holdout_periods, hide_index=True)
+                st.write("Three expanding folds choose shrinkage toward fairness, including an exactly uniform option. "
+                         "The final 20% of draws is untouched during tuning. A pass requires improvement in at least "
+                         "two rolling folds and two holdout sections, plus a positive lower holdout interval. "
+                         "This tests the probability model, not the win rate of its ten selected tickets.")
+        exploratory = False
+        if draw_model.fitted and not draw_model.eligible and pd.notna(draw_model.strength) and draw_model.strength != float("inf"):
+            exploratory = st.checkbox("Show unvalidated model estimates (exploratory only)", value=False)
+            if exploratory:
+                st.warning("These differences failed validation. They are model estimates, not evidence that these tickets are more likely to win.")
+        day = st.date_input("Week containing", value=datetime.now(ZoneInfo("Europe/Paris")).date())
+        iso = day.isocalendar()
+        week = f"{iso.year}-W{iso.week:02d}"
+        try:
+            ranking_key = f"{draw_key}|{draw_model.snapshot}|{draw_model.eligible}|{draw_model.strength}"
+            table = rank_draws(ranking_key, week, exploratory, draw_model)
+        except (ValueError, ArithmeticError, RuntimeError) as exc:
+            table = None
+            st.error(f"Ranking could not be completed: {exc}")
+        if table is not None:
+            # Session history is kept separately for each game. Different weeks
+            # and presentation modes are not mistaken for new historical data.
+            history_key = f"draw_history_{kind}"
+            history = st.session_state.get(history_key)
+            basis = (draw_model.snapshot, exploratory)
+            previous = None
+            if history and history["basis"] != basis:
+                previous = history["table"]
+                st.session_state[f"draw_previous_{kind}"] = previous
+            elif history:
+                previous = st.session_state.get(f"draw_previous_{kind}")
+            st.session_state[history_key] = {"basis": basis, "table": table.copy()}
+            shown = D.compare_rankings(table, previous)
+            st.write(f"Ten combinations for {week} — {kind_label}")
+            if (table.Evidence == "Uniform baseline: tied").all():
+                st.caption("All ten are tied at rank 1. They are a reproducible weekly random selection; "
+                           "a new list does not imply new winning odds.")
+            else:
+                st.caption("These are the exact ten highest-probability outcomes under this model. "
+                           "They may share many numbers, or differ only in Chance. Ties share a rank. "
+                           "The week is an organizational label; it does not itself change modeled probabilities.")
+            visible = [c for c in shown if c not in ("Snapshot", "Week", "Draw", "Data through")]
+            formats = {c: "%.8e" for c in ("Estimated probability", "Fair-draw probability", "Refit range 10%", "Refit range 90%") if c in shown}
+            config = {c: st.column_config.NumberColumn(c, format=fmt) for c, fmt in formats.items()}
+            config["Equivalent 1 in"] = st.column_config.NumberColumn("Equivalent 1 in", format="%.0f")
+            config["Model / fair"] = st.column_config.NumberColumn("Model / fair", format="%.4f")
+            st.dataframe(shown[visible], hide_index=True, column_config=config)
+            st.caption("Refit ranges, when shown, span the 10th–90th percentiles of 40 block resamples with fixed shrinkage. "
+                       "They measure sensitivity, are not confidence bounds, and do not correct for selecting the top ten. "
+                       "Rank changes compare with the previous dataset/mode in this browser session. CSV exports preserve snapshots.")
+            st.download_button("Download weekly probability ranking", shown.to_csv(index=False, sep=";").encode("utf-8-sig"),
+                               f"loto_draw_ranking_{week}.csv", "text/csv")
+        with st.expander("Model assumptions and limits"):
+            st.write("The model assigns normalized probabilities to unordered sets of exactly five distinct balls. "
+                     "It estimates persistent per-ball weights, shrunk toward equality, and an independent Chance distribution. "
+                     "It is a statistical bias model, not a reconstruction of the physical draw machine. "
+                     "It cannot represent every possible interaction, machine change or time-dependent bias. "
+                     "Repeatedly changing scopes or inspecting refreshed holdouts can overfit the evidence; "
+                     "a genuine advantage would need confirmation on newly arriving draws.")
+    else:
+        st.info("Enable the experiment to fit the model, inspect the held-out comparison, and produce a weekly table of ten outcomes.")
 
 with rec_tab:
     if model.eligible:
